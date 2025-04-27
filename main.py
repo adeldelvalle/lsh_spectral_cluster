@@ -1,77 +1,53 @@
 import numpy as np, faiss
 from scipy.sparse import csr_matrix, diags
 from scipy.sparse.linalg import eigsh
-import numpy as np
 import matplotlib.pyplot as plt
 from sklearn.decomposition import PCA
 from sklearn.cluster import KMeans
 from sklearn.preprocessing import normalize
 import pandas as pd
-from sklearn.metrics import silhouette_score, calinski_harabasz_score, davies_bouldin_score
+from sklearn.metrics import silhouette_score, calinski_harabasz_score, davies_bouldin_score, adjusted_rand_score
+from sklearn.datasets import load_digits
+from sklearn.preprocessing import StandardScaler
+import scipy.sparse as sp
+from sklearn.datasets import fetch_openml
 
-# ---------- 1) datos  -------------------------------------------------------
-N, d = 100_000, 200
-X = np.random.randn(N, d).astype('float32')
+import time
+
+start = time.time()
+
+# 1. carga y normaliza
+X, y_true = fetch_openml('Fashion-MNIST', version=1, return_X_y=True, as_frame=False)
+X = X.astype('float32') / 255.0
+y_true = y_true.astype(int)  # ← fix here
+
+X = np.ascontiguousarray(X)
 faiss.normalize_L2(X)
 
-# ---------- 2) índice LSH  --------------------------------------------------
-n_bits = 128
-index  = faiss.IndexLSH(d, n_bits)
-index.add(X)
+# 2. LSH index
+d, n_bits, k, L = X.shape[1], 310, 4, 10
+index = faiss.IndexLSH(d, n_bits); index.add(X)
+I = index.search(X, k)[1]
 
-# ---------- 3) búsqueda k-NN -----------------------------------------------
-k = 3            # self + 5
-_, I = index.search(X, k)     # I: (N, k)
+# 3. grafo k-NN (sin mutuo para N pequeño)
+rows = np.repeat(np.arange(X.shape[0]), k-1)
+cols = I[:,1:].ravel()
+A = sp.csr_matrix((np.ones_like(rows), (rows, cols)), shape=(X.shape[0],)*2)
+A = A.maximum(A.T)           # simétrico
 
-# ---------- 4) grafo dirigido ----------------------------------------------
-rows = np.repeat(np.arange(N), k-1)     # i
-cols = I[:, 1:].ravel()                 # j  (sin el propio i)
-mask = rows != cols                     # evita self-loops
-rows, cols = rows[mask], cols[mask]
+# 4. Laplaciano + espectro
+deg = np.asarray(A.sum(1)).ravel()
+L = sp.diags(deg) - A
+D_inv_sqrt = sp.diags(1/np.sqrt(deg+1e-9))
+L_norm = D_inv_sqrt @ L @ D_inv_sqrt
+eigvals, eigvecs = eigsh(L_norm, k=10, which='SM')
 
-A_dir = csr_matrix((np.ones_like(rows), (rows, cols)), shape=(N, N))
+# 5. clustering
+Y = eigvecs / np.linalg.norm(eigvecs, axis=1, keepdims=True)
+labels = KMeans(n_clusters=10).fit_predict(Y)
+end = time.time()
 
-# ---------- 5) grafo MUTUO  -------------------------------------------------
-A_mut = A_dir.minimum(A_dir.T)          # intersección (element-wise min)
-
-# (Opcional) elimina la diagonal si quedó algo
-A_mut.setdiag(0); A_mut.eliminate_zeros()
-
-# ---------- 6) Laplaciano espectral -----------------------------------------
-degrees = np.asarray(A_mut.sum(axis=1)).ravel()
-D_inv_sqrt = diags(1.0 / np.sqrt(degrees.clip(min=1e-9)))
-L = D_inv_sqrt @ (diags(degrees) - A_mut) @ D_inv_sqrt
-
-eigvals, eigvecs = eigsh(L, k=10, which='SM', tol=1e-3)
-
-# 1. Row‑normalize eigenvectors (Ng, Jordan & Weiss step)
-Y = normalize(eigvecs)
-
-# 2. K‑Means to get final cluster labels
-n_clusters = 10
-kmeans = KMeans(n_clusters=n_clusters, n_init='auto', random_state=42)
-labels = kmeans.fit_predict(Y)
-
-# 3. Reduce to 2‑D for plotting with PCA (fast, deterministic)
-pca = PCA(n_components=2, random_state=0)
-Y_2d = pca.fit_transform(Y)
-
-# 4. Build a small dataframe with a sample (for interactive inspection)
-sample_idx = np.random.choice(len(Y_2d), size=min(1000, len(Y_2d)), replace=False)
-df_sample = pd.DataFrame({
-    "PC1": Y_2d[sample_idx, 0],
-    "PC2": Y_2d[sample_idx, 1],
-    "cluster": labels[sample_idx]
-})
-
-
-# 5. Scatter plot of all points (alpha blending for density)
-plt.figure(figsize=(6, 6))
-plt.scatter(Y_2d[:, 0], Y_2d[:, 1], c=labels, s=3, alpha=0.6, cmap='tab10')
-plt.title("Spectral Clusters (PCA‑2D)")
-plt.xlabel("PC1")
-plt.ylabel("PC2")
-plt.tight_layout()
+print(f"time: {end - start}")
 plt.savefig("a")
 
 
@@ -81,7 +57,29 @@ plt.savefig("a")
 sil  = silhouette_score(Y, labels, metric="euclidean")
 ch   = calinski_harabasz_score(Y, labels)
 dbi  = davies_bouldin_score(Y, labels)
+print("Adjusted Rand:", adjusted_rand_score(y_true, labels))
 
 print(f"Silhouette           : {sil: .3f}  (↑ better, max 1)")
 print(f"Calinski-Harabasz    : {ch: .1f}  (↑ better)")
 print(f"Davies-Bouldin index : {dbi: .3f}  (↓ better, min 0)")
+from sklearn.metrics import confusion_matrix
+import seaborn as sns, matplotlib.pyplot as plt
+from scipy.optimize import linear_sum_assignment
+
+cm  = confusion_matrix(y_true, labels)
+# Hungarian: maximizar trazas  ≡  minimizar coste negativo
+row_ind, col_ind = linear_sum_assignment(-cm)
+cm_aligned = cm[:, col_ind]
+
+# métricas recalculadas
+acc = cm_aligned.diagonal().sum() / cm.sum()
+print("Accuracy tras alineación:", acc)
+
+
+sns.heatmap(cm_aligned, annot=True, fmt='d', cmap='Blues')
+plt.title("Digits – predicted clusters vs. true labels")
+plt.savefig("b")
+from sklearn.metrics import normalized_mutual_info_score
+
+nmi = normalized_mutual_info_score(y_true, labels)
+print("NMI:", nmi)
