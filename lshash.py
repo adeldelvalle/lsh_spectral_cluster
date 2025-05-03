@@ -6,11 +6,10 @@
 # -*- coding: utf-8 -*-
 from __future__ import print_function, unicode_literals, division, absolute_import
 from builtins import int, round, str, object  # noqa
-
-try:
-    basestring
-except NameError:
-    basestring = str
+import numpy as np
+import matplotlib.pyplot as plt
+import networkx as nx
+import matplotlib.cm as cm
 
 # import future        # noqa
 import builtins  # noqa
@@ -20,21 +19,14 @@ import six  # noqa
 import os
 import json
 import numpy as np
-
-try:
-    from storage import storage  # py2
-except ImportError:
-    from .storage import storage  # py3
+from sklearn.decomposition import PCA
 
 try:
     from bitarray import bitarray
 except ImportError:
     bitarray = None
 
-try:
-    xrange  # py2
-except NameError:
-    xrange = range  # py3
+xrange = range  # py3
 
 
 class LSHash(object):
@@ -153,145 +145,173 @@ class LSHash(object):
             hashes_per_table.append(hashes)
 
         # hashes_per_table is a list of L lists, each containing N hash strings
-        return np.array(hashes_per_table).T  # (N, L) shape (points × tables)
+        # return np.array(hashes_per_table).T  # (N, L) shape (points × tables)
 
-    def find_strict_neighbors(self, points):
-        edges = set()
+    def find_topk_neighbors_with_weights(self, points, k=34):
+        """
+        Return a list of weighted edges based on LSH voting, keeping only top-k neighbors per point.
+        Each edge is (point_i, point_j, weight), where weight is number of shared buckets.
+        """
+        edge_weights = dict()
 
         for point_idx, point in enumerate(points):
-            neighbors = None
+            vote_counter = dict()
 
+            # Count how many times each point appeared in the same bucket as this point
             for table_idx, table in enumerate(self.hash_tables):
                 hash_val = self._hash_batch(self.uniform_planes[table_idx], np.array([point]))[0]
-                bucket = set(table.get(hash_val, []))  # safer with .get() if key not present
+                bucket = set(table.get(hash_val, []))
 
-                if neighbors is None:
-                    neighbors = bucket
-                else:
-                    neighbors = neighbors.intersection(bucket)
+                for neighbor_idx in bucket:
+                    if neighbor_idx == point_idx:
+                        continue
+                    vote_counter[neighbor_idx] = vote_counter.get(neighbor_idx, 0) + 1
 
-                if not neighbors:
-                    break  # early exit if no more candidates
+            # Select top-k neighbors with highest votes
+            top_neighbors = sorted(vote_counter.items(), key=lambda x: -x[1])[:k]
 
-            if neighbors:
-                self.stitch(point_idx, neighbors, edges)
+            for neighbor_idx, votes in top_neighbors:
+                edge = tuple(sorted((point_idx, neighbor_idx)))
+                if edge not in edge_weights or votes > edge_weights[edge]:
+                    edge_weights[edge] = votes
 
-        return edges
+        # Convert to list of weighted edges
+        weighted_edges = [(i, j, w) for (i, j), w in edge_weights.items()]
+        return weighted_edges
 
-    def stitch(self, point_idx, neighbors, edges):
-        for neighbor in neighbors:
-            edge = frozenset((point_idx, neighbor))
-            edges.add(edge)
 
-    def query(self, query_point, num_results=None, distance_func=None):
-        """ Takes `query_point` which is either a tuple or a list of numbers,
-        returns `num_results` of results as a list of tuples that are ranked
-        based on the supplied metric function `distance_func`.
 
-        :param query_point:
-            A list, or tuple, or numpy ndarray that only contains numbers.
-            The dimension needs to be 1 * `input_dim`.
-            Used by :meth:`._hash`.
-        :param num_results:
-            (optional) Integer, specifies the max amount of results to be
-            returned. If not specified all candidates will be returned as a
-            list in ranked order.
-        :param distance_func:
-            (optional) The distance function to be used. Currently it needs to
-            be one of ("hamming", "euclidean", "true_euclidean",
-            "centred_euclidean", "cosine", "l1norm"). By default "euclidean"
-            will used.
-        """
 
-        candidates = set()
-        if not distance_func:
-            distance_func = "euclidean"
+from sklearn.datasets import load_digits
 
-        if distance_func == "hamming":
-            if not bitarray:
-                raise ImportError(" Bitarray is required for hamming distance")
+from sklearn.datasets import fetch_openml
+import numpy as np
 
-            for i, table in enumerate(self.hash_tables):
-                binary_hash = self._hash(self.uniform_planes[i], query_point)
-                for key in table.keys():
-                    distance = LSHash.hamming_dist(key, binary_hash)
-                    if distance < 2:
-                        candidates.update(table.get_list(key))
+# Load Fashion-MNIST
+#fashion_mnist = fetch_openml('Fashion-MNIST', version=1, as_frame=False)
 
-            d_func = LSHash.euclidean_dist_square
+#points = fashion_mnist['data']  # (70000, 784)
+#labels = fashion_mnist['target']  # String labels: '0', '1', ..., '9'
 
-        else:
+# Convert labels to integers
+#labels = labels.astype(int)
 
-            if distance_func == "euclidean":
-                d_func = LSHash.euclidean_dist_square
-            elif distance_func == "true_euclidean":
-                d_func = LSHash.euclidean_dist
-            elif distance_func == "centred_euclidean":
-                d_func = LSHash.euclidean_dist_centred
-            elif distance_func == "cosine":
-                d_func = LSHash.cosine_dist
-            elif distance_func == "l1norm":
-                d_func = LSHash.l1norm_dist
-            else:
-                raise ValueError("The distance function name is invalid.")
+# Load the small Digits dataset (8x8 images)
+from sklearn.datasets import fetch_openml
 
-            for i, table in enumerate(self.hash_tables):
-                binary_hash = self._hash(self.uniform_planes[i], query_point)
-                candidates.update(table.get_list(binary_hash))
+mnist = fetch_openml('mnist_784', version=1, as_frame=False)
 
-        # rank candidates by distance function
-        candidates = [(ix, d_func(query_point, self._as_np_array(ix)))
-                      for ix in candidates]
-        candidates = sorted(candidates, key=lambda x: x[1])
+points = mnist.data
+labels = mnist.target.astype(int)
 
-        return candidates[:num_results] if num_results else candidates
+# Optional: take only 60,000 if you want train only
+points = points[:50000]
+labels = labels[:50000]
 
-    def get_hashes(self, input_point):
-        """ Takes a single input point `input_point`, iterate through the
-        uniform planes, and returns a list with size of `num_hashtables`
-        containing the corresponding hash for each hashtable.
 
-        :param input_point:
-            A list, or tuple, or numpy ndarray object that contains numbers
-            only. The dimension needs to be 1 * `input_dim`.
-        """
+# PCA for visualization
+pca = PCA(n_components=2)
+points_2d = pca.fit_transform(points)
 
-        hashes = []
-        for i, table in enumerate(self.hash_tables):
-            binary_hash = self._hash(self.uniform_planes[i], input_point)
-            hashes.append(binary_hash)
+# Plot
+plt.scatter(points_2d[:, 0], points_2d[:, 1], c=labels, cmap='tab10', s=15)
+plt.title("Digits dataset (PCA projection)")
+plt.colorbar(label='Digit label')
+plt.show()
 
-        return hashes
+lsh = LSHash(10, points.shape[1], 40)
+lsh.index_batch(points)
+edges = lsh.find_topk_neighbors_with_weights(points)
 
-    ### distance functions
+G = nx.Graph()
+G.add_weighted_edges_from(edges)
 
-    @staticmethod
-    def hamming_dist(bitarray1, bitarray2):
-        xor_result = bitarray(bitarray1) ^ bitarray(bitarray2)
-        return xor_result.count()
 
-    @staticmethod
-    def euclidean_dist(x, y):
-        """ This is a hot function, hence some optimizations are made. """
-        diff = np.array(x) - y
-        return np.sqrt(np.dot(diff, diff))
+# Add nodes
+G.add_nodes_from(range(len(points)))  # Add all points as nodes
 
-    @staticmethod
-    def euclidean_dist_square(x, y):
-        """ This is a hot function, hence some optimizations are made. """
-        diff = np.array(x) - y
-        return np.dot(diff, diff)
+# Add edges
+for edge in edges:
+    node_list = list(edge)
+    G.add_edge(node_list[0], node_list[1])
 
-    @staticmethod
-    def euclidean_dist_centred(x, y):
-        """ This is a hot function, hence some optimizations are made. """
-        diff = np.mean(x) - np.mean(y)
-        return np.dot(diff, diff)
 
-    @staticmethod
-    def l1norm_dist(x, y):
-        return sum(abs(x - y))
+# Build the pos dictionary for plotting
+pos = {i: points_2d[i] for i in range(len(points))}
 
-    @staticmethod
-    def cosine_dist(x, y):
-        return 1 - float(np.dot(x, y)) / ((np.dot(x, x) * np.dot(y, y)) ** 0.5)
+
+import community as community_louvain  # this is the Louvain package
+
+# Run Louvain clustering
+partition = community_louvain.best_partition(G, weight='weight')
+
+# 'partition' is a dict: node index -> community id
+# Example: {0: 2, 1: 1, 2: 2, 3: 0, ...}
+degrees = [deg for _, deg in G.degree()]
+plt.hist(degrees, bins=50)
+# Extract community labels
+louvain_labels = np.array([partition.get(i, -1) for i in range(len(points))])
+
+from scipy.stats import mode
+
+# Match Louvain clusters to majority digit labels
+label_mapping = {}
+unique_louvain_clusters = np.unique(louvain_labels)
+
+for cluster_id in unique_louvain_clusters:
+    mask = (louvain_labels == cluster_id)
+    majority_label = mode(labels[mask], keepdims=False).mode
+    label_mapping[cluster_id] = majority_label
+
+# Remap Louvain labels
+mapped_labels = np.array([label_mapping[cluster_id] for cluster_id in louvain_labels])
+
+# Normalize Louvain labels between 0 and 1
+norm_labels = (louvain_labels - np.min(louvain_labels)) / (np.max(louvain_labels) - np.min(louvain_labels))
+
+# Use a continuous colormap like 'viridis' or 'plasma'
+cmap = cm.get_cmap('nipy_spectral')
+
+plt.figure(figsize=(8, 6))
+plt.scatter(points_2d[:, 0], points_2d[:, 1], c=norm_labels, cmap=cmap, s=20)
+plt.title("PCA Projection with Louvain Communities (continuous colors)")
+plt.colorbar(label='Cluster ID (normalized)')
+plt.show()
+
+# Plot graph with Louvain communities
+plt.figure(figsize=(8, 6))
+nx.draw(
+    G, pos, node_size=20,
+    node_color=louvain_labels, cmap=cmap,
+    with_labels=False, edge_color='gray'
+)
+plt.title("Louvain Clustering on Stitched Graph (PCA projection)")
+plt.show()
+
+from sklearn.metrics import adjusted_rand_score, normalized_mutual_info_score
+
+# Compute scores between ground truth labels and your mapped Louvain labels
+ari_score = adjusted_rand_score(labels, louvain_labels)
+nmi_score = normalized_mutual_info_score(labels, louvain_labels)
+
+print(f"Adjusted Rand Index (ARI): {ari_score:.4f}")
+print(f"Normalized Mutual Information (NMI): {nmi_score:.4f}")
+print(f"Number of Louvain communities: {len(np.unique(louvain_labels))}")
+from collections import Counter
+counter = Counter(louvain_labels)
+print(f"Cluster sizes (top 10 largest): {counter.most_common(10)}")
+
+# Graph layout based on edge forces (not PCA)
+pos_spring = nx.spring_layout(G, iterations=30)
+
+plt.figure(figsize=(8, 6))
+nx.draw(
+    G, pos_spring, node_size=20,
+    node_color=louvain_labels, cmap=cmap,
+    with_labels=False, edge_color='gray'
+)
+plt.title("Louvain Clustering on Stitched Graph (Spring Layout)")
+plt.show()
+
+
+
