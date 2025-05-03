@@ -6,16 +6,11 @@
 # -*- coding: utf-8 -*-
 from __future__ import print_function, unicode_literals, division, absolute_import
 from builtins import int, round, str, object  # noqa
-import numpy as np
-import matplotlib.pyplot as plt
-import networkx as nx
-import matplotlib.cm as cm
-
 # import future        # noqa
 import builtins  # noqa
 # import past          # noqa
 import six  # noqa
-
+import math
 import os
 import json
 import numpy as np
@@ -91,12 +86,31 @@ class LSHash(object):
 
         self.hash_tables = [{} for i in xrange(self.num_hashtables)]
 
-    def _generate_uniform_planes(self):
-        """ Generate uniformly distributed hyperplanes and return it as a 2D
-        numpy array.
+    def _generate_uniform_planes(self, similarity_threshold=0.8, max_attempts=5000):
         """
+        Generate a 2D numpy array of quasi-orthogonal projection vectors.
+        Each row is a normalized projection vector.
+        """
+        planes = []
+        attempts = 0
 
-        return np.random.randn(self.hash_size, self.input_dim)
+        while len(planes) < self.hash_size and attempts < max_attempts:
+            v = np.random.randn(self.input_dim)
+            v /= np.linalg.norm(v)
+
+            is_similar = any(
+                abs(np.dot(v, u)) > similarity_threshold for u in planes
+            )
+
+            if not is_similar:
+                planes.append(v)
+
+            attempts += 1
+
+        if len(planes) < self.hash_size:
+            print(f"⚠️ Only generated {len(planes)} diverse planes out of requested {self.hash_size}")
+
+        return np.array(planes)
 
     def _hash_batch(self, planes, input_points):
         """
@@ -147,7 +161,7 @@ class LSHash(object):
         # hashes_per_table is a list of L lists, each containing N hash strings
         # return np.array(hashes_per_table).T  # (N, L) shape (points × tables)
 
-    def find_topk_neighbors_with_weights(self, points, k=34):
+    def find_topk_neighbors_with_weights(self, points, k=15):
         """
         Return a list of weighted edges based on LSH voting, keeping only top-k neighbors per point.
         Each edge is (point_i, point_j, weight), where weight is number of shared buckets.
@@ -165,153 +179,22 @@ class LSHash(object):
                 for neighbor_idx in bucket:
                     if neighbor_idx == point_idx:
                         continue
-                    vote_counter[neighbor_idx] = vote_counter.get(neighbor_idx, 0) + 1
+                    vote_counter[neighbor_idx] = vote_counter.get(neighbor_idx, 0) + (1 / math.log(len(bucket) + 1))
 
             # Select top-k neighbors with highest votes
             top_neighbors = sorted(vote_counter.items(), key=lambda x: -x[1])[:k]
 
             for neighbor_idx, votes in top_neighbors:
                 edge = tuple(sorted((point_idx, neighbor_idx)))
-                if edge not in edge_weights or votes > edge_weights[edge]:
-                    edge_weights[edge] = votes
+                if edge not in edge_weights:
+                    edge_weights[edge] = np.exp(votes/k)
+                else:
+                    edge_weights[edge] = edge_weights[edge]**2
+
+
 
         # Convert to list of weighted edges
         weighted_edges = [(i, j, w) for (i, j), w in edge_weights.items()]
         return weighted_edges
-
-
-
-
-from sklearn.datasets import load_digits
-
-from sklearn.datasets import fetch_openml
-import numpy as np
-
-# Load Fashion-MNIST
-#fashion_mnist = fetch_openml('Fashion-MNIST', version=1, as_frame=False)
-
-#points = fashion_mnist['data']  # (70000, 784)
-#labels = fashion_mnist['target']  # String labels: '0', '1', ..., '9'
-
-# Convert labels to integers
-#labels = labels.astype(int)
-
-# Load the small Digits dataset (8x8 images)
-from sklearn.datasets import fetch_openml
-
-mnist = fetch_openml('mnist_784', version=1, as_frame=False)
-
-points = mnist.data
-labels = mnist.target.astype(int)
-
-# Optional: take only 60,000 if you want train only
-points = points[:50000]
-labels = labels[:50000]
-
-
-# PCA for visualization
-pca = PCA(n_components=2)
-points_2d = pca.fit_transform(points)
-
-# Plot
-plt.scatter(points_2d[:, 0], points_2d[:, 1], c=labels, cmap='tab10', s=15)
-plt.title("Digits dataset (PCA projection)")
-plt.colorbar(label='Digit label')
-plt.show()
-
-lsh = LSHash(10, points.shape[1], 40)
-lsh.index_batch(points)
-edges = lsh.find_topk_neighbors_with_weights(points)
-
-G = nx.Graph()
-G.add_weighted_edges_from(edges)
-
-
-# Add nodes
-G.add_nodes_from(range(len(points)))  # Add all points as nodes
-
-# Add edges
-for edge in edges:
-    node_list = list(edge)
-    G.add_edge(node_list[0], node_list[1])
-
-
-# Build the pos dictionary for plotting
-pos = {i: points_2d[i] for i in range(len(points))}
-
-
-import community as community_louvain  # this is the Louvain package
-
-# Run Louvain clustering
-partition = community_louvain.best_partition(G, weight='weight')
-
-# 'partition' is a dict: node index -> community id
-# Example: {0: 2, 1: 1, 2: 2, 3: 0, ...}
-degrees = [deg for _, deg in G.degree()]
-plt.hist(degrees, bins=50)
-# Extract community labels
-louvain_labels = np.array([partition.get(i, -1) for i in range(len(points))])
-
-from scipy.stats import mode
-
-# Match Louvain clusters to majority digit labels
-label_mapping = {}
-unique_louvain_clusters = np.unique(louvain_labels)
-
-for cluster_id in unique_louvain_clusters:
-    mask = (louvain_labels == cluster_id)
-    majority_label = mode(labels[mask], keepdims=False).mode
-    label_mapping[cluster_id] = majority_label
-
-# Remap Louvain labels
-mapped_labels = np.array([label_mapping[cluster_id] for cluster_id in louvain_labels])
-
-# Normalize Louvain labels between 0 and 1
-norm_labels = (louvain_labels - np.min(louvain_labels)) / (np.max(louvain_labels) - np.min(louvain_labels))
-
-# Use a continuous colormap like 'viridis' or 'plasma'
-cmap = cm.get_cmap('nipy_spectral')
-
-plt.figure(figsize=(8, 6))
-plt.scatter(points_2d[:, 0], points_2d[:, 1], c=norm_labels, cmap=cmap, s=20)
-plt.title("PCA Projection with Louvain Communities (continuous colors)")
-plt.colorbar(label='Cluster ID (normalized)')
-plt.show()
-
-# Plot graph with Louvain communities
-plt.figure(figsize=(8, 6))
-nx.draw(
-    G, pos, node_size=20,
-    node_color=louvain_labels, cmap=cmap,
-    with_labels=False, edge_color='gray'
-)
-plt.title("Louvain Clustering on Stitched Graph (PCA projection)")
-plt.show()
-
-from sklearn.metrics import adjusted_rand_score, normalized_mutual_info_score
-
-# Compute scores between ground truth labels and your mapped Louvain labels
-ari_score = adjusted_rand_score(labels, louvain_labels)
-nmi_score = normalized_mutual_info_score(labels, louvain_labels)
-
-print(f"Adjusted Rand Index (ARI): {ari_score:.4f}")
-print(f"Normalized Mutual Information (NMI): {nmi_score:.4f}")
-print(f"Number of Louvain communities: {len(np.unique(louvain_labels))}")
-from collections import Counter
-counter = Counter(louvain_labels)
-print(f"Cluster sizes (top 10 largest): {counter.most_common(10)}")
-
-# Graph layout based on edge forces (not PCA)
-pos_spring = nx.spring_layout(G, iterations=30)
-
-plt.figure(figsize=(8, 6))
-nx.draw(
-    G, pos_spring, node_size=20,
-    node_color=louvain_labels, cmap=cmap,
-    with_labels=False, edge_color='gray'
-)
-plt.title("Louvain Clustering on Stitched Graph (Spring Layout)")
-plt.show()
-
 
 
